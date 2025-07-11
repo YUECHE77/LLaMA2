@@ -10,7 +10,6 @@ from torch import nn
 
 from llama.generation import Generation
 from llama.lora import Linear as LoRALinear
-import torch.utils.checkpoint
 
 
 @dataclass
@@ -92,10 +91,10 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))  # Rotary frequency
     t = torch.arange(end, device=freqs.device)  # Position of each token (until "end"). type: ignore
-    freqs = torch.outer(t, freqs).float()  # Shape [seq_len, dim//2]. Where seq_len = end. type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64 (complex numbers: Norm=torch.ones_like(freqs)=1, angles=freqs)
+    freqs = torch.outer(t, freqs).float()  # Shape [max_seq_len, dim//2]. Where max_seq_len = end. type: ignore
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64 (complex numbers: Norm=torch.ones_like(freqs)=1, Angles=freqs)
 
-    return freqs_cis  # [seq_len, dim//2]
+    return freqs_cis  # [max_seq_len * 2, dim // 2]
 
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
@@ -117,9 +116,12 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
         AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
     """
     ndim = x.ndim
+
     assert 0 <= 1 < ndim
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+
     return freqs_cis.view(*shape)
 
 
@@ -144,11 +146,15 @@ def apply_rotary_emb(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified Query tensor and Key tensor with rotary embeddings.
     """
+    # After reshape, shapes of xq = xk = [B, seq_len, H, head_dim/2, 2]
+    # With torch.view_as_complex() -> become: [B, seq_len, H, head_dim/2]
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
 
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)  # [1, seq_len, 1, head_dim/2]
 
+    # After torch.view_as_real() -> become: [B, seq_len, H, head_dim/2, 2]
+    # And after flatten(3) -> become: [B, seq_len, H, head_dim]
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
 
@@ -158,8 +164,10 @@ def apply_rotary_emb(
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, n_kv_heads, head_dim = x.shape
+
     if n_rep == 1:
         return x
+    
     return (
         x[:, :, :, None, :]
         .expand(bs, slen, n_kv_heads, n_rep, head_dim)
@@ -169,7 +177,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     """Multi-head attention module without KV cache."""
-    def __init__(self, args: ModelArgs, layer_id: int=None):
+    def __init__(self, args: ModelArgs, layer_idx: int=None):
         """
         Initialize the Attention module.
 
@@ -195,7 +203,7 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
-        self.layer_id = layer_id
+        self.layer_idx = layer_idx
 
         # self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wq = LoRALinear(args.dim, self.n_kv_heads * self.head_dim, r=16, lora_alpha=32, bias=False)
@@ -223,30 +231,30 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
-        bsz, seqlen, _ = x.shape
+        bsz, seqlen, _ = x.shape  # [B, seq_len, 4096]
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)  # [B, seq_len, H, head_dim]
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)  # n_local_kv_heads = n_local_heads = 32 -> [B, seq_len, H, head_dim]
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)  # n_local_kv_heads = n_local_heads = 32 -> [B, seq_len, H, head_dim]
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = xk.transpose(1, 2) # (bs, n_local_kv_heads, seqlen, head_dim)
-        values = xv.transpose(1, 2) # (bs, n_local_kv_heads, seqlen, head_dim)
-
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        values = repeat_kv(values, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
 
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        query_states = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        key_states = xk.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        value_states = xv.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+
+        scores = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)  # [B, H, seq_len, seq_len]
 
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
 
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        scores = F.softmax(scores.float(), dim=-1).type_as(query_states)
+        output = torch.matmul(scores, value_states)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
         return self.wo(output)
@@ -294,12 +302,12 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(self, layer_idx: int, args: ModelArgs):
         """
         Initialize a TransformerBlock.
 
         Args:
-            layer_id (int): Identifier for the layer.
+            layer_idx (int): Identifier for the layer.
             args (ModelArgs): Model configuration parameters.
 
         Attributes:
@@ -308,23 +316,26 @@ class TransformerBlock(nn.Module):
             head_dim (int): Dimension size of each attention head.
             attention (Attention): Attention module.
             feed_forward (FeedForward): FeedForward module.
-            layer_id (int): Identifier for the layer.
+            layer_idx (int): Identifier for the layer.
             attention_norm (RMSNorm): Layer normalization for attention output.
             ffn_norm (RMSNorm): Layer normalization for feedforward output.
 
         """
         super().__init__()
+
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args, layer_id=layer_id)
+        self.layer_idx = layer_idx
+
+        self.attention = Attention(args, layer_idx=layer_idx)
         self.feed_forward = FeedForward(
             dim=args.dim,
             hidden_dim=4 * args.dim,
             multiple_of=args.multiple_of,
             ffn_dim_multiplier=args.ffn_dim_multiplier,
         )
-        self.layer_id = layer_id
+
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
@@ -383,8 +394,8 @@ class Llama(Generation):
         )
 
         self.layers = torch.nn.ModuleList()
-        for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
+        for layer_idx in range(params.n_layers):
+            self.layers.append(TransformerBlock(layer_idx, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
@@ -407,10 +418,13 @@ class Llama(Generation):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
+        # !!! 99% of the time of "RuntimeError: CUDA error: device-side assert triggered" comes from indices
+        # that are out of range for an nn.Embedding (**negative pad ID**, BOS/EOS = 32000, or an OOV token) !!!
+        # Refer: 1. https://github.com/meta-llama/llama/issues/380 2. https://discuss.huggingface.co/t/llama2-pad-token-for-batched-inference/48020
         _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[:seqlen]
+        h = self.tok_embeddings(tokens)  # [B, seq_len, 4096]
+        self.freqs_cis = self.freqs_cis.to(h.device)  # [max_seq_len * 2, dim // 2] = [512, 64]
+        freqs_cis = self.freqs_cis[:seqlen]  # [seq_len, 64]
 
         mask = None
         if seqlen > 1:
@@ -421,7 +435,6 @@ class Llama(Generation):
 
         for layer in self.layers:
             h = layer(h, freqs_cis, mask)
-            # h = torch.utils.checkpoint.checkpoint(layer, h, freqs_cis, mask, use_reentrant=False)
 
         h = self.norm(h)
         output = self.output(h).float()

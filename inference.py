@@ -1,20 +1,19 @@
 import argparse
-from llama.tokenizer import Tokenizer
-from llama.model import ModelArgs, Llama
 import torch
+from llama.utils import setup_seeds, load_model_and_tokenizer
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", type=str, help="Path to the LLaMA2 model",
+                        default="/data3/yueche/Llama-2-7b-chat")
+    parser.add_argument("--max-len", type=int, help="The max generation length", default=128)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top-p", type=float, default=0.9)
+    args = parser.parse_args()
+    setup_seeds(seed=727)
 
-def inference(args):
-    torch.manual_seed(1)
-
-    tokenizer = Tokenizer(args.tokenizer_path)
-
-    checkpoint = torch.load(args.model_path, map_location="cpu", weights_only=True)
-    model_args = ModelArgs()
-    model = Llama(model_args)
-    model.half() # Run inference in FP16
-    model.load_state_dict(checkpoint, strict=False)
-    model.to("cuda")
+    model, tokenizer = load_model_and_tokenizer(args.model_path, torch_dtype=torch.float16)
+    model.eval()
 
     prompts = [
         "I believe the meaning of life is",
@@ -31,22 +30,17 @@ def inference(args):
         plush girafe => girafe peluche
         cheese =>""",
     ]
-
     prompt_tokens = [tokenizer.encode(x, bos=True, eos=False) for x in prompts]
 
-    model.eval()
-    results = model.generate(tokenizer, prompt_tokens, max_gen_len=128, temperature=0.7, top_p=0.9)
+    results = model.generate(
+        tokenizer, 
+        prompt_tokens, 
+        max_gen_len=args.max_len, 
+        temperature=args.temperature, 
+        top_p=args.top_p,
+    )
 
     for prompt, result in zip(prompts, results):
         print(prompt)
         print(f"> {result['generation']}")
         print("\n==================================\n")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--tokenizer_path", type=str, required=True, help="Path to the tokenizer model.")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to the model checkpoint.")
-
-    args = parser.parse_args()
-    inference(args)

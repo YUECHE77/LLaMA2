@@ -10,13 +10,15 @@ class Generation(nn.Module):
         total_len = max_gen_len + max_prompt_len
         tokens = torch.full((bsz, total_len), tokenizer.pad_id, dtype=torch.long, device="cuda")
         for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            tokens[k, :len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
 
         eos_reached = torch.tensor([False] * bsz, device="cuda")
         input_text_mask = tokens != tokenizer.pad_id
 
         for cur_pos in range(min_prompt_len, total_len):
             with torch.no_grad():
+                if tokens[:, :cur_pos].min().item() == -1:
+                    print('Found!!!')
                 logits = self(tokens[:, :cur_pos])
 
             if temperature > 0:

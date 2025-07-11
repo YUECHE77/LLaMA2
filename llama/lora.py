@@ -48,11 +48,11 @@ class Linear(nn.Linear, LoRALayer):
 
         # Actual trainable parameters
         if r > 0:
-            self.lora_A = nn.Parameter(self.weight.new_zeros((r, in_features)))
-            self.lora_B = nn.Parameter(self.weight.new_zeros((out_features, r)))
+            self.lora_A = nn.Parameter(self.weight.new_zeros((r, in_features)))  # [r, in_features] = [16, 4096]
+            self.lora_B = nn.Parameter(self.weight.new_zeros((out_features, r)))  # [out_features, r] = [4096, 16]
             self.scaling = self.lora_alpha / self.r
             # Freezing the pre-trained weight matrix
-            self.weight.requires_grad = False
+            self.weight.requires_grad = False  # self.weight.shape = [4096, 4096]
 
         self.reset_parameters()
 
@@ -77,13 +77,15 @@ class Linear(nn.Linear, LoRALayer):
             if self.merge_weights and self.merged:
                 # Make sure that the weights are not merged
                 if self.r > 0:
+                    # Usually, we are NOT fan_in_fan_out. lora_A = [r, in_features] lora_B = [out_features, r]
                     self.weight.data -= T(self.lora_B @ self.lora_A) * self.scaling
                 self.merged = False
         else:
             if self.merge_weights and not self.merged:
                 # Merge the weights and mark it
                 if self.r > 0:
-                    self.weight.data += T(self.lora_B @ self.lora_A) * self.scaling
+                    # self.weight.data += T(self.lora_B @ self.lora_A) * self.scaling
+                    pass
                 self.merged = True       
 
     def forward(self, x: torch.Tensor):
