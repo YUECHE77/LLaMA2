@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 import time
+from tqdm import tqdm
 from typing import List, Dict, Optional
 
 import torch
@@ -109,6 +110,8 @@ if __name__ == "__main__":
                         default="/data3/yueche/Llama-2-7b-chat")
     parser.add_argument("--data-path", type=str, help="Path to the training data",
                         default="/home/yueche/miniconda3/LLaMA2/alpaca_data_200_samples.json")
+    parser.add_argument("--save-path", type=str, help="The path to save the lora weights",
+                        default="/data3/yueche/myLLaMA2_lora/lora_weights.pth")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, help="Learning rate", default=1e-5)
     parser.add_argument("--accumulate-steps", type=int, help="Gradient accumulate steps", default=8)
@@ -140,12 +143,13 @@ if __name__ == "__main__":
 
     start = time.time()
     for epoch in range(5):
-        for i, batch in enumerate(dataloader):
+        print(f"Epoch {epoch + 1}")
+        for i, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             input_ids = batch['input_ids'].to("cuda")  # [B, seq_len]
             labels = batch['labels'].to("cuda")  # [B, seq_len]
 
             with torch.amp.autocast('cuda', dtype=torch.float16):
-                logits = model(input_ids)  # [B, seq_len, vocab_size]
+                logits = model(input_ids, start_pos=0)  # [B, seq_len, vocab_size]
                 shift_logits = logits[..., :-1, :].contiguous()  # [B, seq_len - 1, vocab_size]
                 shift_labels = labels[..., 1:].contiguous()  # [B, seq_len - 1]
                 shift_logits = shift_logits.view(-1, tokenizer.n_words)  # vocab_size = tokenizer.n_words = 32000
@@ -168,4 +172,5 @@ if __name__ == "__main__":
     # Save LoRA weights
     model_weights = model.state_dict()
     lora_weights = {k: v for k, v in model_weights.items() if "lora_" in k}
-    torch.save(lora_weights, "lora_weights.pth")
+    torch.save(lora_weights, args.save_path)
+    print(f'Lora weights (after training) has been saved to: {args.save_path}')

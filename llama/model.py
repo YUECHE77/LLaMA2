@@ -24,7 +24,7 @@ class ModelArgs:
     norm_eps: float = 1e-5
 
     max_batch_size: int = 4
-    max_seq_len: int = 256
+    max_seq_len: int = 512
 
 
 class RMSNorm(torch.nn.Module):
@@ -212,50 +212,81 @@ class Attention(nn.Module):
         self.wv = LoRALinear(args.dim, self.n_kv_heads * self.head_dim, r=16, lora_alpha=32, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
+        self.cache_k = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+        self.cache_v = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+
     def forward(
         self,
         x: torch.Tensor,
+        start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        use_cache: bool = True,
     ):
         """
         Forward pass of the attention module.
 
         Args:
-            x (torch.Tensor): Input tensor.
-            Removed: start_pos (int): Starting position for caching.
-            freqs_cis (torch.Tensor): Precomputed frequency tensor.
-            mask (torch.Tensor, optional): Attention mask tensor.
+            x (`torch.Tensor`): Input tensor.
+            start_pos (`int`): Starting position for caching.
+            freqs_cis (`torch.Tensor`): Precomputed frequency tensor.
+            mask (`torch.Tensor`, `optional`): Attention mask tensor.
+            use_cache (`bool`): Use KV Cache or not.
 
         Returns:
             torch.Tensor: Output tensor after attention.
-
         """
-        bsz, seqlen, _ = x.shape  # [B, seq_len, 4096]
+        bsz, q_len, _ = x.shape  # [B, q_len, hidden_dim]
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)  # [B, seq_len, H, head_dim]
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)  # n_local_kv_heads = n_local_heads = 32 -> [B, seq_len, H, head_dim]
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)  # n_local_kv_heads = n_local_heads = 32 -> [B, seq_len, H, head_dim]
+        xq = xq.view(bsz, q_len, self.n_local_heads, self.head_dim)  # [B, q_len, H, head_dim]
+        xk = xk.view(bsz, q_len, self.n_local_kv_heads, self.head_dim)  # [B, q_len, H, head_dim]: n_local_kv_heads = n_local_heads = 32
+        xv = xv.view(bsz, q_len, self.n_local_kv_heads, self.head_dim)  # [B, q_len, H, head_dim]: n_local_kv_heads = n_local_heads = 32
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
+        if not self.training and use_cache:
+            self.cache_k = self.cache_k.to(xq.dtype)
+            self.cache_v = self.cache_v.to(xq.dtype)
+            self.cache_k[:bsz, start_pos : start_pos + q_len] = xk
+            self.cache_v[:bsz, start_pos : start_pos + q_len] = xv
+
+            keys = self.cache_k[:bsz, : start_pos + q_len]
+            values = self.cache_v[:bsz, : start_pos + q_len]
+        else:
+            keys = xk
+            values = xv
+
         # repeat k/v heads if n_kv_heads < n_heads
-        xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        keys = repeat_kv(keys, self.n_rep)  # [B, seq_len, H, head_dim]
+        values = repeat_kv(values, self.n_rep)  # [B, seq_len, H, head_dim]
 
-        query_states = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        key_states = xk.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        value_states = xv.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        query_states = xq.transpose(1, 2)  # [B, H, q_len, head_dim]
+        key_states = keys.transpose(1, 2)  # [B, H, seq_len, head_dim]
+        value_states = values.transpose(1, 2)  # [B, H, seq_len, head_dim]
 
-        scores = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)  # [B, H, seq_len, seq_len]
+        scores = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)  # [B, H, q_len, seq_len]
 
         if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = scores + mask  # [B, H, q_len, seq_len]
 
         scores = F.softmax(scores.float(), dim=-1).type_as(query_states)
-        output = torch.matmul(scores, value_states)  # (bs, n_local_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        output = torch.matmul(scores, value_states)  # [B, H, q_len, head_dim]
+        output = output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
 
         return self.wo(output)
 
@@ -342,8 +373,10 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        use_cache: bool = True,
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -353,15 +386,16 @@ class TransformerBlock(nn.Module):
             start_pos (int): Starting position for attention caching.
             freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
             mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
+            use_cache (`bool`): Use KV Cache or not.
 
         Returns:
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention.forward(
-            self.attention_norm(x), freqs_cis, mask
+        h = x + self.attention(
+            self.attention_norm(x), start_pos, freqs_cis, mask, use_cache
         )
-        out = h + self.feed_forward.forward(self.ffn_norm(h))
+        out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
 
@@ -406,13 +440,14 @@ class Llama(Generation):
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
 
-    def forward(self, tokens: torch.Tensor, start_pos = 0):
+    def forward(self, tokens: torch.Tensor, start_pos: int, use_cache: bool = True):
         """
         Perform a forward pass through the Transformer model.
 
         Args:
             tokens (torch.Tensor): Input token indices.
             start_pos (int): Starting position for attention caching.
+            use_cache (`bool`): Use KV Cache or not.
 
         Returns:
             torch.Tensor: Output logits after applying the Transformer model.
@@ -421,20 +456,26 @@ class Llama(Generation):
         # !!! 99% of the time of "RuntimeError: CUDA error: device-side assert triggered" comes from indices
         # that are out of range for an nn.Embedding (**negative pad ID**, BOS/EOS = 32000, or an OOV token) !!!
         # Refer: 1. https://github.com/meta-llama/llama/issues/380 2. https://discuss.huggingface.co/t/llama2-pad-token-for-batched-inference/48020
-        _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)  # [B, seq_len, 4096]
+        bsz, q_len = tokens.shape
+        h = self.tok_embeddings(tokens)  # [B, q_len, hidden_dim]
         self.freqs_cis = self.freqs_cis.to(h.device)  # [max_seq_len * 2, dim // 2] = [512, 64]
-        freqs_cis = self.freqs_cis[:seqlen]  # [seq_len, 64]
+        freqs_cis = self.freqs_cis[start_pos : start_pos + q_len]  # [q_len, 64]
 
         mask = None
-        if seqlen > 1:
+        if q_len > 1:
             mask = torch.full(
-                (seqlen, seqlen), float("-inf"), device=tokens.device
+                (q_len, q_len), float("-inf"), device=tokens.device
             )
             mask = torch.triu(mask, diagonal=1)  # only retain upper triangle as -inf
 
+            # Useless code -> only changed the dtype to float16:
+            mask = torch.hstack([
+                torch.zeros((q_len, start_pos), device=tokens.device),
+                mask
+            ]).type_as(h)
+
         for layer in self.layers:
-            h = layer(h, freqs_cis, mask)
+            h = layer(h, start_pos, freqs_cis, mask, use_cache)
 
         h = self.norm(h)
         output = self.output(h).float()

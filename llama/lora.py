@@ -84,8 +84,7 @@ class Linear(nn.Linear, LoRALayer):
             if self.merge_weights and not self.merged:
                 # Merge the weights and mark it
                 if self.r > 0:
-                    # self.weight.data += T(self.lora_B @ self.lora_A) * self.scaling
-                    pass
+                    self.weight.data += T(self.lora_B @ self.lora_A) * self.scaling
                 self.merged = True       
 
     def forward(self, x: torch.Tensor):

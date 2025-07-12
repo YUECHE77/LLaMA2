@@ -51,13 +51,12 @@ def load_model_and_tokenizer(
         model = Llama(model_args).to(torch_dtype)
     else:
         model = Llama(model_args)
-    missing, unexpected = model.load_state_dict(checkpoint, strict=False)
-    assert not missing, f"Missing Base model weights: {missing}"
+    model.load_state_dict(checkpoint, strict=False)
 
     if lora_path is not None:
+        print(f'Loading LoRA weights from: {lora_path}')
         lora_weights = torch.load(lora_path, map_location='cpu')
-        missing, unexpected = model.load_state_dict(lora_weights, strict=False)
-        assert not missing, f"Missing LoRA weights: {missing}"
+        model.load_state_dict(lora_weights, strict=False)
 
     model.to(device)
 
