@@ -132,14 +132,16 @@ class Generation(nn.Module):
         top_p: Optional[float] = None,
         use_cache: bool = True,
     ):
+        max_seq_len = self.params.max_seq_len  # default: 1024
         prompt_tokens = []
         unsafe_requests = []
         for dialog in dialogs:
             unsafe_requests.append(
                 any([tag in msg["content"] for tag in SPECIAL_TAGS for msg in dialog])
             )
+
+            # Combine the system prompt with the first user message
             if dialog[0]['role'] == 'system':
-                # Combine the system prompt with the first user message
                 combined_role = dialog[1]['role']
                 combined_content = B_SYS + dialog[0]['content'] + E_SYS + dialog[1]['content']
                 dialog = [
@@ -190,7 +192,7 @@ class Generation(nn.Module):
             top_k=top_k,
             top_p=top_p,
             echo=False,  # Must be False
-            use_cache=True,
+            use_cache=use_cache,
         )
 
         return [
