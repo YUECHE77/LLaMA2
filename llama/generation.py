@@ -138,3 +138,67 @@ class Generation(nn.Module):
             unsafe_requests.append(
                 any([tag in msg["content"] for tag in SPECIAL_TAGS for msg in dialog])
             )
+            if dialog[0]['role'] == 'system':
+                # Combine the system prompt with the first user message
+                combined_role = dialog[1]['role']
+                combined_content = B_SYS + dialog[0]['content'] + E_SYS + dialog[1]['content']
+                dialog = [
+                    {
+                        "role": combined_role,
+                        "content": combined_content,
+                    }
+                ] + dialog[2:]
+
+            assert all([msg["role"] == "user" for msg in dialog[::2]]) and all(
+                [msg["role"] == "assistant" for msg in dialog[1::2]]
+            ), (
+                "model only supports 'system', 'user' and 'assistant' roles, "
+                "starting with 'system', then 'user' and alternating (u/a/u/a/u...)"
+            )
+
+            dialog_tokens: List[int] = sum(
+                [
+                    tokenizer.encode(
+                        f"{B_INST} {(prompt['content']).strip()} {E_INST} {(answer['content']).strip()} ",
+                        bos=True,
+                        eos=True,
+                    )
+                    for prompt, answer in zip(
+                        dialog[::2],
+                        dialog[1::2],
+                    )
+                ],
+                [],
+            )
+
+            assert dialog[-1]["role"] == "user", f"Last message must be from user, got {dialog[-1]['role']}"
+
+            dialog_tokens += tokenizer.encode(
+                f"{B_INST} {(dialog[-1]['content']).strip()} {E_INST}",
+                bos=True,
+                eos=False,
+            )
+
+            prompt_tokens.append(dialog_tokens)
+        
+        out_tokens = self.generate(
+            tokenizer,
+            prompt_tokens,
+            max_gen_len=max_gen_len,
+            sampling=sampling,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            echo=False,  # Must be False
+            use_cache=True,
+        )
+
+        return [
+            {
+                "generation": {
+                    "role": "assistant",
+                    "content": tokenizer.decode(t) if not unsafe else UNSAFE_ERROR,
+                }
+            }
+            for t, unsafe in zip(out_tokens, unsafe_requests)
+        ]
