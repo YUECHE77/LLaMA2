@@ -9,7 +9,9 @@ if __name__ == "__main__":
                         default="/data3/yueche/Llama-2-7b-chat")
     parser.add_argument("--lora-path", type=str, help="If you have finetuned", default=None)
     parser.add_argument("--max-len", type=int, help="The max generation length", default=128)
+    parser.add_argument("--sampling", action="store_true", help="Use Nucleus sampling")
     parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--report-time", action="store_true", help="Report the inference time")
     args = parser.parse_args()
@@ -44,15 +46,19 @@ if __name__ == "__main__":
     assert len(prompt_tokens) <= model.params.max_batch_size, f'Exceed maximum batch_size ({model.params.max_batch_size})'
 
     start = time.time()
-    results = model.generate(
+    out_tokens = model.generate(
         tokenizer, 
         prompt_tokens, 
         max_gen_len=args.max_len, 
+        sampling=args.sampling,
         temperature=args.temperature, 
+        top_k=args.top_k, 
         top_p=args.top_p,
         use_cache=True,  # it must be True
     )
     end = time.time()
+
+    results = [{"generation": tokenizer.decode(t)} for t in out_tokens]
 
     for prompt, result in zip(prompts, results):
         print(prompt)
