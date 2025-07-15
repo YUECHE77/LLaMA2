@@ -37,6 +37,7 @@ def load_model_and_tokenizer(
     if not spm_files:
         raise FileNotFoundError("No *.model tokenizer file found in %s" % model_dir)
     tokenizer_path = spm_files[0]
+    print(f'Loading the tokenizer from: {tokenizer_path}')
     tokenizer = Tokenizer(tokenizer_path)
 
     ckpt_files = sorted(glob.glob(os.path.join(model_dir, "*.pth")))
@@ -44,6 +45,7 @@ def load_model_and_tokenizer(
         raise FileNotFoundError("No *.pth checkpoint found in %s" % model_dir)
     if len(ckpt_files) > 1:
         print(f"[load_model] Found multiple *.pth files, picking {ckpt_files[0]}")
+    print(f'Loading the model from: {ckpt_files[0]}')
     checkpoint = torch.load(ckpt_files[0], map_location='cpu', weights_only=True)
 
     model_args = ModelArgs()
@@ -59,6 +61,7 @@ def load_model_and_tokenizer(
         model.load_state_dict(lora_weights, strict=False)
 
     model.to(device)
+    print('Modle and Tokenizer are successfully loaded!\n')
 
     return model, tokenizer
 

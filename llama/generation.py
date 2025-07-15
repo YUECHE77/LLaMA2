@@ -135,51 +135,62 @@ class Generation(nn.Module):
         max_seq_len = self.params.max_seq_len  # default: 1024
         prompt_tokens = []
         unsafe_requests = []
+
         for dialog in dialogs:
             unsafe_requests.append(
                 any([tag in msg["content"] for tag in SPECIAL_TAGS for msg in dialog])
             )
 
-            # Combine the system prompt with the first user message
+            sys_tokens = None
             if dialog[0]['role'] == 'system':
-                combined_role = dialog[1]['role']
-                combined_content = B_SYS + dialog[0]['content'] + E_SYS + dialog[1]['content']
-                dialog = [
-                    {
-                        "role": combined_role,
-                        "content": combined_content,
-                    }
-                ] + dialog[2:]
+                sys_content = B_SYS + dialog[0]['content'] + E_SYS
+                sys_tokens = tokenizer.encode(sys_content, bos=False, eos=False)
+                dialog = dialog[1:]  # remove the system prompt
+            B_INST_tokens = tokenizer.encode(B_INST, bos=False, eos=False)
 
-            assert all([msg["role"] == "user" for msg in dialog[::2]]) and all(
-                [msg["role"] == "assistant" for msg in dialog[1::2]]
+            assert all([msg["role"] == "user" for msg in dialog[::2]]) and all([msg["role"] == "assistant" for msg in dialog[1::2]]
             ), (
                 "model only supports 'system', 'user' and 'assistant' roles, "
-                "starting with 'system', then 'user' and alternating (u/a/u/a/u...)"
+                "starting with 'system', then 'user' and alternating (u/a/u/a/u...)."
+                "The even indices (0, 2, 4, ...) should be user's query, "
+                "and the odd indices (1, 3, 5, ...) should be model's response."
             )
-
-            dialog_tokens: List[int] = sum(
-                [
-                    tokenizer.encode(
-                        f"{B_INST} {(prompt['content']).strip()} {E_INST} {(answer['content']).strip()} ",
-                        bos=True,
-                        eos=True,
-                    )
-                    for prompt, answer in zip(
-                        dialog[::2],
-                        dialog[1::2],
-                    )
-                ],
-                [],
-            )
-
             assert dialog[-1]["role"] == "user", f"Last message must be from user, got {dialog[-1]['role']}"
 
-            dialog_tokens += tokenizer.encode(
-                f"{B_INST} {(dialog[-1]['content']).strip()} {E_INST}",
-                bos=True,
-                eos=False,
+            last_role = None
+            dialog_tokens: List[int] = []
+            for message in dialog[::-1]:
+                role = message['role']
+
+                if role == 'user':
+                    content = f"{B_INST} {message['content'].strip()} {E_INST}"  # user's query
+                    tokens = tokenizer.encode(content, bos=True, eos=False)  # no eos
+                else:
+                    content = ' ' + message['content'].strip() + ' '  # model's response
+                    tokens = tokenizer.encode(content, bos=False, eos=True)  # no bos
+                
+                if len(dialog_tokens) + len(tokens) > max_seq_len - len(sys_tokens) - len(B_INST_tokens) - 1:
+                    print('[Warning] Exceed the maximum length, truncating parts of the history.')
+                    break
+
+                last_role = role
+                
+                dialog_tokens = tokens + dialog_tokens
+            
+            assert len(dialog_tokens) != 0, (
+                f"Your query is too long! Model's maximum sequence length is {max_seq_len - len(sys_tokens)}"
             )
+
+            if sys_tokens is not None:
+                if last_role == 'user':
+                    # In this case, the first role is user (It could be assistance, since we can truncate).
+                    assert dialog_tokens[0] == tokenizer.bos_id
+                    dialog_tokens = dialog_tokens[1 + len(B_INST_tokens):]  # Remove BOS and B_INST tokens -> we need to add system prompt
+                    dialog_tokens = [tokenizer.bos_id, ] + B_INST_tokens + sys_tokens + dialog_tokens
+                else:
+                    dialog_tokens = [tokenizer.bos_id, ] + sys_tokens + dialog_tokens
+            
+            assert len(dialog_tokens) < max_seq_len
 
             prompt_tokens.append(dialog_tokens)
         
