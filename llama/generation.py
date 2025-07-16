@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from typing import Optional, List, Dict, Literal, TypedDict
 
@@ -24,6 +25,8 @@ class Generation(nn.Module):
         prompt_tokens: List[List[int]], 
         max_gen_len: int = 128, 
         sampling: bool = False,
+        beam: int = 1,
+        length_penalty: float = 1.0,
         temperature: Optional[float] = None, 
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
@@ -120,6 +123,74 @@ class Generation(nn.Module):
         next_token = torch.gather(probs_idx, -1, next_token)
 
         return next_token
+    
+    def beam(
+        self, 
+        tokenizer: Tokenizer, 
+        prompt_tokens: List[List[int]], 
+        max_gen_len: int = 128, 
+        sampling: bool = False,
+        beam: int = 1,
+        length_penalty: float = 1.0,
+        temperature: Optional[float] = None, 
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        echo: bool = False,  # Flag indicating whether to include prompt tokens in the generated output.
+        use_cache: bool = True,
+    ):
+        raise NotImplementedError("Haven't finished yet!")
+    
+        bsz = len(prompt_tokens)
+        assert bsz == 1, 'Currently only support batch_size = 1'
+        assert bsz * beam <= self.params.max_batch_size
+        
+        min_prompt_len = min(len(t) for t in prompt_tokens)
+        max_prompt_len = max(len(t) for t in prompt_tokens)
+        total_len = max_gen_len + max_prompt_len
+
+        tokens = torch.full((bsz * beam, total_len), tokenizer.pad_id, dtype=torch.long, device="cuda")
+        seq_lens = torch.zeros(bsz * beam, dtype=torch.long, device="cuda")  # Current sequence length
+        beam_scores = torch.zeros(bsz * beam, device="cuda")
+
+        for k, t in enumerate(prompt_tokens):
+            tokens[k * beam : (k + 1) * beam, :len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            seq_lens[k * beam : (k + 1) * beam] = len(t)
+
+        # ---------- Step 1 ----------
+        prev_pos = 0
+        cur_pos = min_prompt_len
+
+        with torch.no_grad():
+            logits = self(tokens[:bsz, :cur_pos], 0, use_cache)[:, -1]  # [B, vocab_size]
+        
+        log_prob = F.log_softmax(logits, dim=-1)  # [B, vocab_size]
+        topk_prob, topk_idx = log_prob.topk(k=beam, dim=-1)  # Both: [B, beam]
+        beam_scores[:bsz * beam] = topk_prob.view(-1)
+        tokens[:bsz * beam, cur_pos] = topk_idx.view(-1)
+        seq_lens += 1
+
+        # Copy the KV Cache
+        for layer in self.layers:
+            layer.attention.cache_k[bsz : bsz * beam] = layer.attention.cache_k[:bsz].repeat(beam - 1, 1, 1, 1)
+            layer.attention.cache_v[bsz : bsz * beam] = layer.attention.cache_v[:bsz].repeat(beam - 1, 1, 1, 1)
+        # ----------------------------
+
+        # ---------- Step 2 ----------
+        for _ in range(1, max_gen_len):
+            cur_pos += 1
+
+            with torch.no_grad():
+                logits = self(tokens[:, cur_pos-1:cur_pos], cur_pos-1, use_cache)[:, -1]  # [B * beam, vocab_size]
+            
+            logprobs = F.log_softmax(logits, -1)  # [B * beam, vocab_size]
+            next_scores = (beam_scores.unsqueeze(-1) + logprobs)  # [B * beam, vocab_size]
+            next_scores = next_scores.view(bsz, beam * tokenizer.n_words)  # [B, beam * vocab_size]
+
+            topk_scores, topk_idx = next_scores.topk(k=beam, dim=-1)  # Both: [B, beam]
+            beam_id = (topk_idx // tokenizer.n_words) + (torch.arange(bsz, device="cuda").unsqueeze(-1) * beam)  # [B, beam]
+            token_id = topk_idx % tokenizer.n_words  # [B, beam]
+        # ----------------------------
+
 
     def chat(
         self, 

@@ -5,7 +5,7 @@ import torch
 from llama.utils import setup_seeds, load_model_and_tokenizer
 
 CURRENT = datetime.now().strftime("%d %b %Y")
-SYSTEM = f'Today Date: {CURRENT}. You are a helpful assistant.'
+SYSTEM = f'You are LLaMA2, created by Meta. Today Date: {CURRENT}. You are a helpful assistant.'
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
